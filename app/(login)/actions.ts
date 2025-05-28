@@ -19,12 +19,12 @@ import {
 import { comparePasswords, hashPassword, setSession } from '@/lib/auth/session';
 import { redirect } from 'next/navigation';
 import { cookies } from 'next/headers';
-import { createCheckoutSession } from '@/lib/payments/stripe';
 import { getUser, getUserWithTeam } from '@/lib/db/queries';
 import {
   validatedAction,
   validatedActionWithUser
 } from '@/lib/auth/middleware';
+import crypto from 'crypto'; // Import crypto for UUID generation
 
 async function logActivity(
   teamId: number | null | undefined,
@@ -91,23 +91,18 @@ export const signIn = validatedAction(signInSchema, async (data, formData) => {
     logActivity(foundTeam?.id, foundUser.id, ActivityType.SIGN_IN)
   ]);
 
-  const redirectTo = formData.get('redirect') as string | null;
-  if (redirectTo === 'checkout') {
-    const priceId = formData.get('priceId') as string;
-    return createCheckoutSession({ team: foundTeam, priceId });
-  }
-
-  redirect('/dashboard');
+  redirect('/');
 });
 
 const signUpSchema = z.object({
+  name: z.string().min(1, { message: "Naam is vereist" }).max(100, { message: "Naam mag maximaal 100 tekens lang zijn" }),
   email: z.string().email(),
-  password: z.string().min(8),
+  password: z.string().min(8, { message: "Wachtwoord moet minimaal 8 tekens lang zijn" }),
   inviteId: z.string().optional()
 });
 
 export const signUp = validatedAction(signUpSchema, async (data, formData) => {
-  const { email, password, inviteId } = data;
+  const { name, email, password, inviteId } = data;
 
   const existingUser = await db
     .select()
@@ -117,27 +112,37 @@ export const signUp = validatedAction(signUpSchema, async (data, formData) => {
 
   if (existingUser.length > 0) {
     return {
-      error: 'Failed to create user. Please try again.',
-      email,
-      password
+      error: 'An account with this email already exists. Please sign in or use a different email.',
     };
   }
 
   const passwordHash = await hashPassword(password);
 
   const newUser: NewUser = {
+    name,
     email,
     passwordHash,
     role: 'owner' // Default role, will be overridden if there's an invitation
   };
 
-  const [createdUser] = await db.insert(users).values(newUser).returning();
+  let createdUserResult;
+  try {
+    createdUserResult = await db.insert(users).values(newUser).returning();
+  } catch (dbError) {
+    console.error("Error inserting user:", dbError); // Log the raw DB error
+    return {
+      error: 'Failed to create user due to a database issue. Please try again.'
+    };
+  }
+
+  const createdUser = createdUserResult?.[0]; // Get the first user from the result array
 
   if (!createdUser) {
+    // This block might now be less likely to be hit if the try/catch gets the error first
+    // but it's a fallback if .returning() yields an empty array for some other reason
+    console.error('User creation did not return a user object, even without a DB error.');
     return {
-      error: 'Failed to create user. Please try again.',
-      email,
-      password
+      error: 'Failed to create user. Please try again.'
     };
   }
 
@@ -176,21 +181,22 @@ export const signUp = validatedAction(signUpSchema, async (data, formData) => {
         .where(eq(teams.id, teamId))
         .limit(1);
     } else {
-      return { error: 'Invalid or expired invitation.', email, password };
+      return { error: 'Invalid or expired invitation.' };
     }
   } else {
     // Create a new team if there's no invitation
     const newTeam: NewTeam = {
-      name: `${email}'s Team`
+      name: `${email}'s Team`,
+      // clubId: crypto.randomUUID(), // <--- REMOVE THIS LINE
+      // personalAccount will use its default value from the schema (false)
+      // other nullable fields (imageUrl, stripe IDs) will be null by default
     };
 
     [createdTeam] = await db.insert(teams).values(newTeam).returning();
 
     if (!createdTeam) {
       return {
-        error: 'Failed to create team. Please try again.',
-        email,
-        password
+        error: 'Failed to create team. Please try again.'
       };
     }
 
@@ -212,20 +218,28 @@ export const signUp = validatedAction(signUpSchema, async (data, formData) => {
     setSession(createdUser)
   ]);
 
-  const redirectTo = formData.get('redirect') as string | null;
-  if (redirectTo === 'checkout') {
-    const priceId = formData.get('priceId') as string;
-    return createCheckoutSession({ team: createdTeam, priceId });
-  }
-
-  redirect('/dashboard');
+  redirect('/');
 });
 
 export async function signOut() {
   const user = (await getUser()) as User;
-  const userWithTeam = await getUserWithTeam(user.id);
-  await logActivity(userWithTeam?.teamId, user.id, ActivityType.SIGN_OUT);
+
+  if (user && user.id) {
+    try {
+      const userWithTeam = await getUserWithTeam(user.id);
+      await logActivity(userWithTeam?.teamId, user.id, ActivityType.SIGN_OUT);
+    } catch (error) {
+      console.warn("Error fetching userWithTeam or logging activity during sign out (user was present initially):", error);
+      // Decide if this error should prevent sign out. For now, it won't.
+    }
+  } else {
+    console.log("User not found during sign out, or user.id is missing. Skipping team-related activity logging.");
+    // Optionally, log a generic sign-out attempt if desired, without userId/teamId
+  }
+  
   (await cookies()).delete('session');
+  // No explicit redirect here, the client should handle navigation after sign-out
+  // or a middleware might redirect if a protected route is accessed without a session.
 }
 
 const updatePasswordSchema = z.object({

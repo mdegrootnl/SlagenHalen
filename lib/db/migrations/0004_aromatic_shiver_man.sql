@@ -1,0 +1,1 @@
+ALTER TABLE "player_round_score_changes" ALTER COLUMN "tricks_taken" SET DEFAULT 0;

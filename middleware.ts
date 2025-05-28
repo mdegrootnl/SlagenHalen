@@ -4,6 +4,9 @@ import { signToken, verifyToken } from '@/lib/auth/session';
 
 const protectedRoutes = '/dashboard';
 
+// Determine if in production based on NODE_ENV
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const sessionCookie = request.cookies.get('session');
@@ -27,7 +30,7 @@ export async function middleware(request: NextRequest) {
           expires: expiresInOneDay.toISOString()
         }),
         httpOnly: true,
-        secure: true,
+        secure: IS_PRODUCTION,
         sameSite: 'lax',
         expires: expiresInOneDay
       });

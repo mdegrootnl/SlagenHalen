@@ -39,17 +39,25 @@ export function validatedActionWithUser<S extends z.ZodType<any, any>, T>(
   action: ValidatedActionWithUserFunction<S, T>
 ) {
   return async (prevState: ActionState, formData: FormData) => {
-    const user = await getUser();
-    if (!user) {
-      throw new Error('User is not authenticated');
-    }
+    try {
+      const user = await getUser();
+      if (!user) {
+        console.error("[validatedActionWithUser] Authentication check failed: getUser() returned null or user is invalid.");
+        return { error: 'User is not authenticated. Please try signing in again.' };
+      }
 
-    const result = schema.safeParse(Object.fromEntries(formData));
-    if (!result.success) {
-      return { error: result.error.errors[0].message };
-    }
+      const result = schema.safeParse(Object.fromEntries(formData));
+      if (!result.success) {
+        console.error("[validatedActionWithUser] Schema validation failed:", result.error.flatten().fieldErrors);
+        return { error: `Invalid input: ${result.error.errors[0].message}` };
+      }
 
-    return action(result.data, formData, user);
+      return await action(result.data, formData, user);
+
+    } catch (err: any) {
+      console.error("[validatedActionWithUser] An error occurred:", err);
+      return { error: err.message || 'An unexpected server error occurred.' };
+    }
   };
 }
 

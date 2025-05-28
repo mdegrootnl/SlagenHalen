@@ -1,0 +1,1 @@
+ALTER TABLE "player_round_score_changes" ADD COLUMN "tricks_taken" integer  NOT NULL;

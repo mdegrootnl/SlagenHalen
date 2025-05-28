@@ -6,11 +6,17 @@ import { verifyToken } from '@/lib/auth/session';
 
 export async function getUser() {
   const sessionCookie = (await cookies()).get('session');
+  //console.log("[getUser] Raw session cookie object:", sessionCookie);
+
   if (!sessionCookie || !sessionCookie.value) {
+    //console.log("[getUser] No session cookie or no value in cookie.");
     return null;
   }
+  //console.log("[getUser] Session cookie value string:", sessionCookie.value);
 
   const sessionData = await verifyToken(sessionCookie.value);
+  //console.log("[getUser] Decoded session data from verifyToken:", JSON.stringify(sessionData, null, 2));
+
   if (
     !sessionData ||
     !sessionData.user ||
@@ -23,6 +29,8 @@ export async function getUser() {
     return null;
   }
 
+  //console.log(`[getUser] Attempting to fetch user from DB with ID: ${sessionData.user.id}`);
+
   const user = await db
     .select()
     .from(users)
@@ -33,35 +41,8 @@ export async function getUser() {
     return null;
   }
 
+  //console.log("[getUser] User fetched from DB:", JSON.stringify(user[0], null, 2));
   return user[0];
-}
-
-export async function getTeamByStripeCustomerId(customerId: string) {
-  const result = await db
-    .select()
-    .from(teams)
-    .where(eq(teams.stripeCustomerId, customerId))
-    .limit(1);
-
-  return result.length > 0 ? result[0] : null;
-}
-
-export async function updateTeamSubscription(
-  teamId: number,
-  subscriptionData: {
-    stripeSubscriptionId: string | null;
-    stripeProductId: string | null;
-    planName: string | null;
-    subscriptionStatus: string;
-  }
-) {
-  await db
-    .update(teams)
-    .set({
-      ...subscriptionData,
-      updatedAt: new Date()
-    })
-    .where(eq(teams.id, teamId));
 }
 
 export async function getUserWithTeam(userId: number) {
@@ -127,4 +108,24 @@ export async function getTeamForUser() {
   });
 
   return result?.team || null;
+}
+
+export async function getTeamById(teamId: number) {
+  const result = await db
+    .select()
+    .from(teams)
+    .where(eq(teams.id, teamId))
+    .limit(1);
+
+  return result.length > 0 ? result[0] : null;
+}
+
+export async function getTeamsByUserId(userId: number) {
+  const result = await db
+    .select()
+    .from(teams)
+    .leftJoin(teamMembers, eq(teams.id, teamMembers.teamId))
+    .where(eq(teamMembers.userId, userId));
+
+  return result;
 }
