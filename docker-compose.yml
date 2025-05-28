@@ -21,9 +21,10 @@ services:
     container_name: kaartspel_app
     environment:
       - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432/postgres
-      - AUTH_SECRET=vGYKkvA2NqDuWVjROsfS/h6wYIMSIO90vezSSkXdYm4=
+      - AUTH_SECRET=fa51e1066130719feacc6d6d93ac2b73182eeaa7ff40c3c45c2a5063865c258f
       - NODE_ENV=production
     ports:
+      - "3000:3000"
       - "3001:3001"
     depends_on:
       postgres:

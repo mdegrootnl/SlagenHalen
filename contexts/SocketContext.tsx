@@ -25,11 +25,14 @@ export const SocketProvider: React.FC<SocketProviderProps> = ({ children }) => {
   const [socket, setSocket] = useState<Socket | null>(null);
 
   useEffect(() => {
-    // The URL should point to your server where Socket.IO is running.
-    // In development, Socket.IO server runs on port 3001, Next.js on port 3000
+    // Socket.IO server always runs on port 3001
+    // In development: explicit localhost:3001
+    // In production: use current hostname but port 3001
     const socketUrl = process.env.NODE_ENV === 'production' 
-      ? undefined // In production, same origin
-      : 'http://localhost:3001'; // In development, explicit port
+      ? `${window.location.protocol}//${window.location.hostname}:3001`
+      : 'http://localhost:3001';
+    
+    console.log('Connecting to Socket.IO server at:', socketUrl);
     
     const newSocket = io(socketUrl); 
 
@@ -41,6 +44,10 @@ export const SocketProvider: React.FC<SocketProviderProps> = ({ children }) => {
 
     newSocket.on('disconnect', () => {
       console.log('Socket disconnected');
+    });
+
+    newSocket.on('connect_error', (error) => {
+      console.error('Socket connection error:', error);
     });
 
     // Cleanup on component unmount

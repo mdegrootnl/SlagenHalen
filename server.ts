@@ -480,13 +480,13 @@ async function startServer() {
   }
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    try {
-      const parsedUrl = parse(req.url!, true);
-      await handle(req, res, parsedUrl);
-    } catch (err) {
+      try {
+        const parsedUrl = parse(req.url!, true);
+        await handle(req, res, parsedUrl);
+      } catch (err) {
       console.error('Error handling request:', err);
-      res.statusCode = 500;
-      res.end('internal server error');
+        res.statusCode = 500;
+        res.end('internal server error');
     }
   });
 
@@ -929,11 +929,11 @@ async function startServer() {
     });
 
     socket.on('createGame', async (data, callback) => {
-      console.log('[Socket Event - createGame] Received:', data);
+        console.log('[Socket Event - createGame] Received:', data);
     });
 
     socket.on('joinGame', async (data: { gameSessionId: number, userId: number }, callback) => {
-      console.log('[Socket Event - joinGame] Received:', data);
+        console.log('[Socket Event - joinGame] Received:', data);
     });
 
     // Handle client notification of new game creation
