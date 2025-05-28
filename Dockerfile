@@ -23,7 +23,7 @@ RUN npm install -g pnpm
 # Install dependencies
 RUN pnpm install --frozen-lockfile
 
-# At this point, all source code including server.ts, next.config.js etc.,
+# At this point, all source code including server.ts, next.config.mjs etc.,
 # are from the cloned repository.
 # The .dockerignore file in your local workspace will NOT affect this git clone.
 # The repository itself should have a .gitignore file to manage what's committed.
@@ -61,9 +61,16 @@ COPY --from=base /app/package.json ./package.json
 COPY --from=base /app/pnpm-lock.yaml ./pnpm-lock.yaml
 COPY --from=base /app/node_modules ./node_modules
 COPY --from=base /app/server.ts ./server.ts
-COPY --from=base /app/next.config.js ./next.config.js
+COPY --from=base /app/next.config.mjs ./next.config.mjs
 COPY --from=base /app/tsconfig.json ./tsconfig.json
+COPY --from=base /app/tailwind.config.js ./tailwind.config.js
+COPY --from=base /app/postcss.config.js ./postcss.config.js
+COPY --from=base /app/drizzle.config.ts ./drizzle.config.ts
+COPY --from=base /app/middleware.ts ./middleware.ts
 COPY --from=base /app/lib ./lib
+COPY --from=base /app/app ./app
+COPY --from=base /app/components ./components
+COPY --from=base /app/contexts ./contexts
 
 # Expose the port the app runs on
 EXPOSE 3001
