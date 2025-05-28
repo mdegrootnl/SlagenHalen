@@ -1,3 +1,4 @@
+
 services:
   postgres:
     image: postgres:16.4-alpine
@@ -10,31 +11,6 @@ services:
       - "54322:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
-
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: next_saas_starter_app
-    ports:
-      - "3001:3001" # Changed host and container port to 3001
-    depends_on:
-      - postgres
-    environment:
-      # Ensure this matches how your application expects the database URL
-      POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/postgres
-      PORT: 3001 # Added PORT environment variable for the app
-      AUTH_SECRET: "vGYKkvA2NqDuWVjROsfS/h6wYIMSIO90vezSSkXdYm4=" # Updated with generated key
-      # Add any other environment variables your Next.js app needs at runtime
-      # e.g., NEXT_PUBLIC_API_URL, etc.
-      # NODE_ENV is already set to production in the Dockerfile
-    restart: unless-stopped
-    # Optional: If you want to mount your local code for development (not recommended for production builds)
-    # volumes:
-    #   - .:/app
-    #   - /app/node_modules # Don't mount local node_modules
-    #   - /app/.next # Don't mount local .next
 
 volumes:
   postgres_data:

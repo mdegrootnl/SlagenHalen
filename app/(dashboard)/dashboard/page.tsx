@@ -9,7 +9,7 @@ import {
   CardTitle,
   CardFooter
 } from '@/components/ui/card';
-import { useActionState } from 'react';
+import { useState } from 'react';
 import { TeamDataWithMembers, User } from '@/lib/db/schema';
 import { removeTeamMember, inviteTeamMember } from '@/app/(login)/actions';
 import useSWR from 'swr';
@@ -49,10 +49,18 @@ function TeamMembersSkeleton() {
 
 function TeamMembers() {
   const { data: teamData } = useSWR<TeamDataWithMembers>('/api/team', fetcher);
-  const [removeState, removeAction, isRemovePending] = useActionState<
-    ActionState,
-    FormData
-  >(removeTeamMember, {});
+  const [removeState, setRemoveState] = useState<ActionState>({});
+  const [isRemovePending, setIsRemovePending] = useState(false);
+
+  const handleRemoveAction = async (formData: FormData) => {
+    setIsRemovePending(true);
+    try {
+      const result = await removeTeamMember(removeState, formData);
+      setRemoveState(result);
+    } finally {
+      setIsRemovePending(false);
+    }
+  };
 
   const getUserDisplayName = (user: Pick<User, 'id' | 'name' | 'email'>) => {
     return user.name || user.email || 'Unknown User';
@@ -108,7 +116,7 @@ function TeamMembers() {
                 </div>
               </div>
               {index > 1 ? (
-                <form action={removeAction}>
+                <form action={handleRemoveAction}>
                   <input type="hidden" name="memberId" value={member.id} />
                   <Button
                     type="submit"
@@ -144,10 +152,18 @@ function InviteTeamMemberSkeleton() {
 function InviteTeamMember() {
   const { data: user } = useSWR<User>('/api/user', fetcher);
   const isOwner = user?.role === 'owner';
-  const [inviteState, inviteAction, isInvitePending] = useActionState<
-    ActionState,
-    FormData
-  >(inviteTeamMember, {});
+  const [inviteState, setInviteState] = useState<ActionState>({});
+  const [isInvitePending, setIsInvitePending] = useState(false);
+
+  const handleInviteAction = async (formData: FormData) => {
+    setIsInvitePending(true);
+    try {
+      const result = await inviteTeamMember(inviteState, formData);
+      setInviteState(result);
+    } finally {
+      setIsInvitePending(false);
+    }
+  };
 
   return (
     <Card>
@@ -155,7 +171,7 @@ function InviteTeamMember() {
         <CardTitle>Invite Team Member</CardTitle>
       </CardHeader>
       <CardContent>
-        <form action={inviteAction} className="space-y-4">
+        <form action={handleInviteAction} className="space-y-4">
           <div>
             <Label htmlFor="email">Email</Label>
             <Input

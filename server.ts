@@ -1,4 +1,4 @@
-import { createServer } from 'http';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { parse } from 'url';
 import next from 'next';
 import { Server as SocketIOServer, Socket } from 'socket.io';
@@ -6,7 +6,7 @@ import { Server as SocketIOServer, Socket } from 'socket.io';
 // Drizzle and DB imports
 import { db } from './lib/db/drizzle';
 import * as schema from './lib/db/schema'; // Import all from schema
-import { eq, and, sql, asc, desc, type InferSelectModel, type InferInsertModel } from 'drizzle-orm'; // Use asc and desc directly
+import { eq, and, sql, asc, desc, inArray, type InferSelectModel, type InferInsertModel } from 'drizzle-orm'; // Use asc and desc directly
 import { ROUND_DISTRIBUTION } from './lib/game/round'; // For bid validation
 import { getTrumpSuit as determineTrumpForNewRound } from './lib/game/round'; // For setting trump in new rounds
 import { calculatePlayerScore } from './lib/game/game'; // Added for scoring
@@ -19,6 +19,19 @@ type GameStatusEnum = "pending" | "active" | "bidding" | "active_play" | "round_
 // Timeout management for round_summary
 const roundSummaryTimeouts = new Map<number, NodeJS.Timeout>();
 const ROUND_SUMMARY_TIMEOUT_MS = 10000; // 10 seconds
+
+const isProduction = process.env.NODE_ENV === 'production';
+const dev = !isProduction; // For Next.js app initialization
+const hostname = 'localhost'; // Or your desired hostname
+const port = parseInt(process.env.PORT || '3001', 10);
+
+let app: ReturnType<typeof next> | undefined;
+let handle: ReturnType<ReturnType<typeof next>['getRequestHandler']> | undefined;
+
+if (isProduction) {
+  app = next({ dev: false, hostname, port }); // Ensure dev is false for production
+  handle = app?.getRequestHandler();
+}
 
 // Helper function to deal cards for a new round
 async function dealCardsForRound(
@@ -460,593 +473,521 @@ async function triggerGameContinuation(io: SocketIOServer, gameId: number, sourc
   });
 }
 
-const dev = process.env.NODE_ENV !== 'production';
-const app = next({ dev });
-const handle = app.getRequestHandler();
-
-const PORT = parseInt(process.env.PORT || '3001', 10);
-
-app.prepare().then(() => {
-  const httpServer = createServer((req, res) => {
-    const parsedUrl = parse(req.url!, true);
-    handle(req, res, parsedUrl);
+// Main function to start the server
+async function startServer() {
+  const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    if (isProduction && handle) { // Only handle Next.js requests in production
+      try {
+        const parsedUrl = parse(req.url!, true);
+        await handle(req, res, parsedUrl);
+      } catch (err) {
+        console.error('Error handling Next.js request:', err);
+        res.statusCode = 500;
+        res.end('internal server error');
+      }
+    } else {
+      // In development (dev:socket mode), or if Next.js handling is not set up
+      res.setHeader('Content-Type', 'application/json');
+      if (req.url === '/health') {
+        res.statusCode = 200;
+        res.end(JSON.stringify({ status: 'ok', mode: isProduction ? 'production' : 'development_socket_only' }));
+      } else {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ message: 'Not Found. This is the Socket.IO server. Next.js handles requests separately in development.' }));
+      }
+    }
   });
 
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: "*", // Allow all origins
+      origin: "*", // Configure as needed for production
       methods: ["GET", "POST"]
     }
   });
-  
+
   io.on('connection', (socket: Socket) => {
-    // // console.log('A user connected:', socket.id); // Can be noisy
+    console.log('A user connected with socket ID:', socket.id);
 
+    socket.on('joinRoom', (roomId) => {
+      socket.join(roomId);
+      console.log(`Socket ${socket.id} joined room ${roomId}`);
+    });
+    
+    socket.on('chatMessage', (data: { roomId: string; message: string; userId?: number }) => {
+      console.log(`Message received in room ${data.roomId} from user ${data.userId || socket.id}: ${data.message}`);
+      io.to(data.roomId).emit('newChatMessage', { 
+        message: data.message, 
+        userId: data.userId || socket.id,
+        timestamp: new Date().toISOString() 
+      });
+    });
+
+    // Game-specific socket handlers
     socket.on('joinGameRoom', (gameId: string) => {
-      socket.join(gameId);
-      // // console.log(\`Socket \${socket.id} joined room \${gameId}\`);
+      socket.join(`game_${gameId}`);
+      console.log(`Socket ${socket.id} joined game room: game_${gameId}`);
     });
 
-    socket.on('clientNewGameCreated', async (data: { newGameId: number }) => {
-      // // console.log(\`[Server] Received clientNewGameCreated for gameId: \${data.newGameId}\`);
-      // Broadcast to all clients (or specific lobby/landing page listeners if you have them)
-      // that the list of open games should be refreshed.
-      io.emit('openGamesUpdated', { newGameId: data.newGameId });
-    });
-
-
-    socket.on('submitBid', async (data: { gameId: number; gamePlayerId: number; bidAmount: number }) => {
-      const { gameId, gamePlayerId, bidAmount } = data;
-      // console.log(`[submitBid] Bid received for game ${gameId}, player ${gamePlayerId}, amount ${bidAmount}`); // Keep this one as it's a key action
-
+    socket.on('submitBid', async (data: { gameId: number; gamePlayerId: number; bidAmount: number; roundNumber: number }) => {
+      console.log(`[Socket submitBid] Received bid from socket ${socket.id}:`, data);
+      
       try {
-        const result = await db.transaction(async (tx) => {
-          // 1. Fetch current game session and bidding player
-          const currentSession = await tx.query.gameSessions.findFirst({
+        const { gameId, gamePlayerId, bidAmount, roundNumber } = data;
+
+        // Validate input
+        if (!gameId || !gamePlayerId || bidAmount === undefined || !roundNumber) {
+          socket.emit('actionError', { message: 'Ongeldige bidgegevens.' });
+          return;
+        }
+
+        await db.transaction(async (tx) => {
+          // Get game session and validate
+          const gameSession = await tx.query.gameSessions.findFirst({
             where: eq(schema.gameSessions.id, gameId),
-            with: { gamePlayers: { orderBy: [asc(schema.gamePlayers.playerOrder)] } } // Use imported schema.gamePlayers
+            with: { 
+              gamePlayers: { 
+                orderBy: [asc(schema.gamePlayers.playerOrder)],
+                with: { user: { columns: { id: true, name: true, email: true } } }
+              } 
+            }
           });
 
-          if (!currentSession) {
-            socket.emit('actionError', { message: 'Game session not found.' });
-            return { success: false, error: 'Game not found' };
-          }
-          if (currentSession.status !== 'bidding') {
-            socket.emit('actionError', { message: 'Not in bidding phase.' });
-            return { success: false, error: 'Not in bidding phase' };
-          }
-          if (currentSession.currentTurnGamePlayerId !== gamePlayerId) {
-            socket.emit('actionError', { message: 'Not your turn to bid.' });
-            return { success: false, error: 'Not your turn' };
-          }
-          if (currentSession.currentRound === null || currentSession.currentRound < 1 || currentSession.currentRound > ROUND_DISTRIBUTION.length) {
-            socket.emit('actionError', { message: 'Invalid round for bidding.' });
-            return { success: false, error: 'Invalid round' };
+          if (!gameSession) {
+            socket.emit('actionError', { message: 'Spelsessie niet gevonden.' });
+            return;
           }
 
-          const cardsThisRound = ROUND_DISTRIBUTION[currentSession.currentRound - 1];
-          if (bidAmount < 0 || bidAmount > cardsThisRound) {
-            socket.emit('actionError', { message: `Invalid bid amount. Must be 0-${cardsThisRound}.` });
-            return { success: false, error: 'Invalid bid amount' };
+          if (gameSession.status !== 'bidding') {
+            socket.emit('actionError', { message: 'Spel is niet in biedfase.' });
+            return;
           }
 
-          // Check if player already bid this round
+          if (gameSession.currentRound !== roundNumber) {
+            socket.emit('actionError', { message: 'Onjuist rondenummer.' });
+            return;
+          }
+
+          // Validate it's the player's turn
+          if (gameSession.currentTurnGamePlayerId !== gamePlayerId) {
+            socket.emit('actionError', { message: 'Het is niet jouw beurt om te bieden.' });
+            return;
+          }
+
+          // Validate bid amount
+          const currentRoundIndex = (gameSession.currentRound || 1) - 1;
+          const maxBid = ROUND_DISTRIBUTION[currentRoundIndex] || 0;
+          if (bidAmount < 0 || bidAmount > maxBid) {
+            socket.emit('actionError', { message: `Bod moet tussen 0 en ${maxBid} zijn.` });
+            return;
+          }
+
+          // Check if player already has a bid for this round
           const existingBid = await tx.query.playerBids.findFirst({
             where: and(
               eq(schema.playerBids.gamePlayerId, gamePlayerId),
-              eq(schema.playerBids.roundNumber, currentSession.currentRound)
+              eq(schema.playerBids.roundNumber, roundNumber)
             )
           });
+
           if (existingBid) {
-            socket.emit('actionError', { message: 'You have already bid this round.' });
-            return { success: false, error: 'Already bid' };
+            socket.emit('actionError', { message: 'Je hebt al een bod ingediend voor deze ronde.' });
+            return;
           }
 
-          // 2. Insert the new bid
-          const newBid: schema.NewPlayerBid = {
+          // Insert the bid
+          await tx.insert(schema.playerBids).values({
             gameSessionId: gameId,
-            gamePlayerId: gamePlayerId,
-            roundNumber: currentSession.currentRound,
-            bidAmount: bidAmount,
+            gamePlayerId,
+            roundNumber,
+            bidAmount,
+            createdAt: new Date()
+          });
+
+          // Determine next player to bid
+          const currentPlayerIndex = gameSession.gamePlayers.findIndex(p => p.id === gamePlayerId);
+          const nextPlayerIndex = (currentPlayerIndex + 1) % gameSession.gamePlayers.length;
+          const nextPlayer = gameSession.gamePlayers[nextPlayerIndex];
+
+          // Check if all players have bid
+          const allBids = await tx.query.playerBids.findMany({
+            where: and(
+              eq(schema.playerBids.roundNumber, roundNumber),
+              inArray(schema.playerBids.gamePlayerId, gameSession.gamePlayers.map(p => p.id))
+            )
+          });
+
+          let gameSessionUpdate: Partial<typeof schema.gameSessions.$inferInsert> = {
+            updatedAt: new Date()
           };
-          await tx.insert(schema.playerBids).values(newBid);
 
-          // 3. Determine next player or end bidding phase
-          const playersInOrder: schema.GamePlayer[] = currentSession.gamePlayers as schema.GamePlayer[];
-          if (playersInOrder.length !== 4) {
-             // Should not happen in a properly started game
-            console.error("Game does not have 4 players during bidding.");
-            socket.emit('actionError', { message: 'Game player count error.' });
-            return { success: false, error: 'Player count error' }; 
-          }
-
-          const currentPlayerIndex = playersInOrder.findIndex((p: schema.GamePlayer) => p.id === gamePlayerId);
-          let nextPlayerGamePlayerId = playersInOrder[(currentPlayerIndex + 1) % 4].id;
-
-          // Check if all players have bid for the current round
-          const allBidsForRound = await tx.select({ gamePlayerId: schema.playerBids.gamePlayerId })
-            .from(schema.playerBids)
-            .innerJoin(schema.gamePlayers, eq(schema.playerBids.gamePlayerId, schema.gamePlayers.id))
-            .where(and(
-                eq(schema.gamePlayers.gameSessionId, gameId),
-                eq(schema.playerBids.roundNumber, currentSession.currentRound)
-            ));
-          
-          let nextStatus: GameStatusEnum = currentSession.status as GameStatusEnum;
-
-          if (allBidsForRound.length === playersInOrder.length) { 
-            // console.log(`[submitBid] All ${allBidsForRound.length} players have bid for round ${currentSession.currentRound} in game ${gameId}.`); 
-            nextStatus = 'active_play';
+          if (allBids.length >= gameSession.gamePlayers.length) {
+            // All players have bid, start playing phase
+            gameSessionUpdate.status = 'active_play';
             
-            // Determine who leads the first trick
-            const dealer = playersInOrder.find((p: schema.GamePlayer) => p.id === currentSession.currentDealerId);
-            if (dealer) {
-                const starterIndex = (playersInOrder.findIndex((p: schema.GamePlayer) => p.id === dealer.id) + 1) % playersInOrder.length;
-                nextPlayerGamePlayerId = playersInOrder[starterIndex].id;
-            } else {
-                // console.error(`Dealer not found for game ${gameId} while transitioning to active state.`);
-                nextPlayerGamePlayerId = playersInOrder[0].id; 
-            }
-            // console.log(`[submitBid] Game ${gameId} transitioning to '${nextStatus}', Trump: ${currentSession.trumpSuit}, First turn: ${nextPlayerGamePlayerId}`); 
+            // Player to the left of dealer starts first trick
+            const playersInOrder = gameSession.gamePlayers.sort((a, b) => a.playerOrder - b.playerOrder);
+            const dealerIndex = playersInOrder.findIndex(p => p.id === gameSession.currentDealerId);
+            const firstPlayerIndex = (dealerIndex + 1) % playersInOrder.length;
+            const firstPlayer = playersInOrder[firstPlayerIndex];
+            
+            gameSessionUpdate.currentTurnGamePlayerId = firstPlayer.id; // Player left of dealer starts first trick
+          } else {
+            // Move to next player
+            gameSessionUpdate.currentTurnGamePlayerId = nextPlayer.id;
           }
-
-          // 4. Update game session (turn, status if changed)
-          const updateData: Partial<Pick<schema.GameSession, 'currentTurnGamePlayerId' | 'status' | 'updatedAt'>> = {
-            currentTurnGamePlayerId: nextPlayerGamePlayerId,
-            status: nextStatus,
-            updatedAt: new Date(),
-          };
 
           await tx.update(schema.gameSessions)
-            .set(updateData)
+            .set(gameSessionUpdate)
             .where(eq(schema.gameSessions.id, gameId));
-          
-          return { success: true, gameId: gameId };
         });
 
-        if (result && result.success) {
-          const updatedGameData = await getGameDataForBroadcast(gameId);
-          if (updatedGameData) {
-            // // console.log('[server.ts/submitBid] Broadcasting updatedGameData:', JSON.stringify(updatedGameData, null, 2)); 
-            io.to(gameId.toString()).emit('gameStateUpdate', updatedGameData);
-            // console.log(`[submitBid] Broadcasted gameStateUpdate for game ${gameId}`); 
-          }
-          socket.emit('bidSuccess', { message: 'Bod succesvol ingediend.', gameId: gameId });
-        } else if (result && result.error) {
-          // console.error(`[submitBid] Bid submission failed for game ${gameId}, player ${gamePlayerId}: ${result.error}`); 
-        }
+        // Broadcast updated game state
+        const updatedGameState = await getGameDataForBroadcast(gameId);
+        io.to(`game_${gameId}`).emit('gameStateUpdate', updatedGameState);
+        socket.emit('bidSuccess', { message: 'Bod succesvol ingediend!', gameId });
 
       } catch (error) {
-        // console.error('[submitBid] Error processing submitBid:', error); 
-        socket.emit('actionError', { message: 'Server error processing bid.' });
+        console.error('[Socket submitBid] Error:', error);
+        socket.emit('actionError', { message: 'Fout bij indienen van bod.' });
       }
     });
 
-    socket.on('disconnect', () => {
-      // console.log('User disconnected:', socket.id); // This is a standard operational log, might keep
-    });
-
-    socket.on('playCard', async (data: { gameId: number; gamePlayerId: number; card: { suit: schema.Suit; rank: schema.Rank } }) => {
-      const { gameId, gamePlayerId, card } = data;
-      console.log(`[playCard ENTER] GameID: ${gameId}, PlayerID: ${gamePlayerId}, Card: ${card.rank} of ${card.suit}`);
-
+    socket.on('playCard', async (data: { gameId: number; gamePlayerId: number; card: { suit: string; rank: string } }) => {
+      console.log(`[Socket playCard] Received card play from socket ${socket.id}:`, data);
+      
       try {
-        const result = await db.transaction(async (tx) => {
-          console.log(`[playCard TXN_START] GameID: ${gameId}, PlayerID: ${gamePlayerId}`);
+        const { gameId, gamePlayerId, card } = data;
 
-          // 1. Fetch current game session, players, and bidding player validation
-          const currentSession = await tx.query.gameSessions.findFirst({
+        // Validate input
+        if (!gameId || !gamePlayerId || !card || !card.suit || !card.rank) {
+          socket.emit('actionError', { message: 'Ongeldige kaartgegevens.' });
+          return;
+        }
+
+        await db.transaction(async (tx) => {
+          // Get game session and validate
+          const gameSession = await tx.query.gameSessions.findFirst({
             where: eq(schema.gameSessions.id, gameId),
-            with: {
-              gamePlayers: { orderBy: [asc(schema.gamePlayers.playerOrder)] },
-            },
+            with: { 
+              gamePlayers: { 
+                orderBy: [asc(schema.gamePlayers.playerOrder)],
+                with: { user: { columns: { id: true, name: true, email: true } } }
+              } 
+            }
           });
 
-          if (!currentSession) {
-            socket.emit('actionError', { message: 'Game session not found.' });
-            return { success: false, error: 'Game not found' };
+          if (!gameSession) {
+            socket.emit('actionError', { message: 'Spelsessie niet gevonden.' });
+            return;
           }
 
-          // DEBUG LOGS FOR PREMATURE ROUND ENDING
-          const debug_numTricksExpectedThisRound = ROUND_DISTRIBUTION[currentSession.currentRound! - 1];
-          console.log(`[playCard DEBUG_ROUND_STATE] GameID: ${gameId}, PlayerID: ${gamePlayerId}, Card: ${card.rank}${card.suit}`);
-          console.log(`[playCard DEBUG_ROUND_STATE] currentSession.status: ${currentSession.status}`);
-          console.log(`[playCard DEBUG_ROUND_STATE] currentSession.currentRound: ${currentSession.currentRound}`);
-          console.log(`[playCard DEBUG_ROUND_STATE] currentSession.currentTrickNumberInRound (from DB): ${currentSession.currentTrickNumberInRound}`);
-          console.log(`[playCard DEBUG_ROUND_STATE] calculated numTricksExpectedThisRound (for currentRound ${currentSession.currentRound}): ${debug_numTricksExpectedThisRound}`);
-          // END DEBUG LOGS
-
-          const playersInOrderRaw = currentSession.gamePlayers;
-
-          if (currentSession.status !== 'active_play') {
-            socket.emit('actionError', { message: 'Not in active play phase.' });
-            return { success: false, error: 'Not in active_play phase' };
-          }
-          if (currentSession.currentTurnGamePlayerId !== gamePlayerId) {
-            socket.emit('actionError', { message: 'Not your turn to play.' });
-            return { success: false, error: 'Not your turn' };
-          }
-          if (currentSession.currentRound === null) {
-            socket.emit('actionError', { message: 'Current round is not set.' });
-            return { success: false, error: 'Round not set' };
+          if (gameSession.status !== 'active_play') {
+            socket.emit('actionError', { message: 'Spel is niet in speelfase.' });
+            return;
           }
 
-          // Card validation (is it in player's hand? is it a valid play for the trick?)
-          const actualCardInDbHandToPlay = await tx.query.playerRoundHands.findFirst({
+          // Validate it's the player's turn
+          if (gameSession.currentTurnGamePlayerId !== gamePlayerId) {
+            socket.emit('actionError', { message: 'Het is niet jouw beurt om te spelen.' });
+            return;
+          }
+
+          // Validate player has this card in their hand
+          const playerCard = await tx.query.playerRoundHands.findFirst({
             where: and(
               eq(schema.playerRoundHands.gamePlayerId, gamePlayerId),
-              eq(schema.playerRoundHands.roundNumber, currentSession.currentRound),
-              eq(schema.playerRoundHands.cardSuit, card.suit),
-              eq(schema.playerRoundHands.cardRank, card.rank),
-              eq(schema.playerRoundHands.isPlayed, false) 
+              eq(schema.playerRoundHands.gameSessionId, gameId),
+              eq(schema.playerRoundHands.roundNumber, gameSession.currentRound || 1),
+              eq(schema.playerRoundHands.cardSuit, card.suit as schema.Suit),
+              eq(schema.playerRoundHands.cardRank, card.rank as schema.Rank),
+              eq(schema.playerRoundHands.isPlayed, false)
             )
           });
 
-          if (!actualCardInDbHandToPlay) {
-            socket.emit('actionError', { message: 'Invalid card played or card not in hand.' });
-            return { success: false, error: 'Invalid card' };
+          if (!playerCard) {
+            socket.emit('actionError', { message: 'Je hebt deze kaart niet in je hand.' });
+            return;
           }
-          
-          // Fetch current trick's cards (if any) to validate play
-          const currentTrickCardsPlayed = await tx.query.playedCardsInTricks.findMany({
+
+          // Get player's full hand for validation
+          const playerHandRecords = await tx.query.playerRoundHands.findMany({
+            where: and(
+              eq(schema.playerRoundHands.gamePlayerId, gamePlayerId),
+              eq(schema.playerRoundHands.gameSessionId, gameId),
+              eq(schema.playerRoundHands.roundNumber, gameSession.currentRound || 1),
+              eq(schema.playerRoundHands.isPlayed, false)
+            )
+          });
+
+          // Convert to offline format for validation
+          const playerHand: OfflineCard[] = playerHandRecords.map(handCard => ({
+            suit: handCard.cardSuit as schema.Suit,
+            rank: handCard.cardRank as schema.Rank
+          }));
+
+          const cardToPlay: OfflineCard = { suit: card.suit as schema.Suit, rank: card.rank as schema.Rank };
+
+          // Determine lead suit for this trick
+          const existingPlaysForValidation = await tx.query.playedCardsInTricks.findMany({
             where: and(
               eq(schema.playedCardsInTricks.gameSessionId, gameId),
-              eq(schema.playedCardsInTricks.roundNumber, currentSession.currentRound),
-              eq(schema.playedCardsInTricks.trickNumberInRound, currentSession.currentTrickNumberInRound ?? 0)
+              eq(schema.playedCardsInTricks.roundNumber, gameSession.currentRound || 1),
+              eq(schema.playedCardsInTricks.trickNumberInRound, gameSession.currentTrickNumberInRound || 1)
             ),
             orderBy: [asc(schema.playedCardsInTricks.playSequenceInTrick)]
           });
-          
-          const isFirstCardOfTrick = currentTrickCardsPlayed.length === 0;
 
-          const leadSuitForTrick = isFirstCardOfTrick ? card.suit : currentSession.currentTrickLeadSuit;
-          
-          const playerHandForValidation: OfflineCard[] = (await tx.query.playerRoundHands.findMany({
-            where: and(
-              eq(schema.playerRoundHands.gamePlayerId, gamePlayerId),
-              eq(schema.playerRoundHands.roundNumber, currentSession.currentRound),
-              eq(schema.playerRoundHands.isPlayed, false)
-            ),
-            columns: { cardSuit: true, cardRank: true }
-          })).map(c => ({ suit: c.cardSuit, rank: c.cardRank }));
+          const leadSuit = existingPlaysForValidation.length > 0 ? existingPlaysForValidation[0].cardSuit : null;
+          const trumpSuit = gameSession.trumpSuit || 'HEARTS';
 
-          if (!currentSession.trumpSuit) {
-            socket.emit('actionError', { message: 'Server error: Trump suit not set during active play.' });
-            return { success: false, error: 'Trump suit is null in active_play' };
+          // Validate the play using game rules
+          if (!isValidPlay(playerHand, cardToPlay, leadSuit, trumpSuit)) {
+            socket.emit('actionError', { message: 'Ongeldige kaartspel. Je moet de kleur volgen als je deze hebt, anders troef spelen als je troef hebt.' });
+            return;
           }
 
-          if (!isValidPlay(playerHandForValidation, card, leadSuitForTrick, currentSession.trumpSuit)) {
-            socket.emit('actionError', { message: 'Invalid play. You must follow suit if possible.' });
-            return { success: false, error: 'Invalid play according to rules' };
-          }
-          // --- End Card Validation ---
-          
-          let currentPlayedTrickId: number | undefined = undefined;
-          let playSequenceInTrick = 0;
-
-          if (currentTrickCardsPlayed.length > 0) {
-            const existingTrick = await tx.query.playedTricks.findFirst({
-               where: and(
-                  eq(schema.playedTricks.gameSessionId, gameId),
-                  eq(schema.playedTricks.roundNumber, currentSession.currentRound),
-                  eq(schema.playedTricks.roundTrickNumber, currentSession.currentTrickNumberInRound ?? 0)
-               )
-            });
-            currentPlayedTrickId = existingTrick?.id;
-            playSequenceInTrick = currentTrickCardsPlayed.length; // 0-indexed, so length is next sequence
-          } else {
-            // console.log(`[playCard] Creating new trick for Game ${gameId}, Round ${currentSession.currentRound}, TrickNum ${currentSession.currentTrickNumberInRound}`); // Less critical
-            const [newTrick] = await tx.insert(schema.playedTricks).values({
-              gameSessionId: gameId,
-              roundNumber: currentSession.currentRound,
-              roundTrickNumber: currentSession.currentTrickNumberInRound ?? 1, // Default to 1 if null
-              leadSuit: isFirstCardOfTrick ? leadSuitForTrick : null, // Set leadSuit if first card
-            }).returning({ id: schema.playedTricks.id });
-            if (!newTrick || typeof newTrick.id !== 'number') {
-                socket.emit('actionError', { message: 'Failed to create new trick entry.' });
-                return { success: false, error: 'Failed to create trick' };
-            }
-            currentPlayedTrickId = newTrick.id;
-            // console.log(`[playCard] New trick created with ID: ${currentPlayedTrickId}`); // Less critical
-          }
-          
-          // Update card as played in player's hand
+          // Mark card as played
           await tx.update(schema.playerRoundHands)
             .set({ isPlayed: true })
-            .where(eq(schema.playerRoundHands.id, actualCardInDbHandToPlay.id)); // Use the specific ID of the card from hand
+            .where(eq(schema.playerRoundHands.id, playerCard.id));
 
-          // Record the played card in the trick
-          await tx.insert(schema.playedCardsInTricks).values({
-            playedTrickId: currentPlayedTrickId!,
-            gamePlayerId: gamePlayerId,
-            cardSuit: card.suit,
-            cardRank: card.rank,
-            playSequenceInTrick: playSequenceInTrick,
-            gameSessionId: gameId, // Context field
-            roundNumber: currentSession.currentRound,
-            trickNumberInRound: currentSession.currentTrickNumberInRound ?? 1, // Context field
-          });
-
-          // --- Check if Trick is Over ---
-          const cardsInCurrentTrickAfterPlay = await tx.query.playedCardsInTricks.findMany({
+          // Get or create current trick
+          let currentTrick = await tx.query.playedTricks.findFirst({
             where: and(
-              eq(schema.playedCardsInTricks.gameSessionId, gameId),
-              eq(schema.playedCardsInTricks.roundNumber, currentSession.currentRound),
-              eq(schema.playedCardsInTricks.trickNumberInRound, currentSession.currentTrickNumberInRound ?? 1)
-            ),
-             orderBy: [asc(schema.playedCardsInTricks.playSequenceInTrick)]
+              eq(schema.playedTricks.gameSessionId, gameId),
+              eq(schema.playedTricks.roundNumber, gameSession.currentRound || 1),
+              eq(schema.playedTricks.roundTrickNumber, gameSession.currentTrickNumberInRound || 1)
+            )
           });
-          
-          let trickOver = false;
-          let winningGamePlayerIdForDb: number | undefined = undefined;
 
-          if (cardsInCurrentTrickAfterPlay.length === playersInOrderRaw.length) { // Assuming 4 players
-            trickOver = true;
-            // Determine trick winner
-            const playedCardsForWinnerDet: OfflinePlayedCard[] = cardsInCurrentTrickAfterPlay.map(c => ({
-                card: { suit: c.cardSuit, rank: c.cardRank } as OfflineCard, // Simpler cast if suits/ranks align
-                playerId: c.gamePlayerId.toString() // determineTrickWinner expects string IDs
-            }));
-            
-            const leadSuitForThisTrick = currentSession.currentTrickLeadSuit || playedCardsForWinnerDet[0]?.card.suit; // Fallback if somehow not set
-            const winningOfflinePlayedCard = determineTrickWinner(playedCardsForWinnerDet, currentSession.trumpSuit!); // Removed leadSuitForThisTrick as it's inferred by determineTrickWinner
-            winningGamePlayerIdForDb = parseInt(winningOfflinePlayedCard.playerId, 10);
-
-            // Update playedTricks table with winner
-            if (winningGamePlayerIdForDb && currentPlayedTrickId) {
-              await tx.update(schema.playedTricks)
-                .set({ winningGamePlayerId: winningGamePlayerIdForDb /*, updatedAt: new Date() */ }) // updatedAt might not be in playedTricks schema or handled by default
-                .where(eq(schema.playedTricks.id, currentPlayedTrickId));
-              
-              // Increment tricks taken for the winner
-              await tx.update(schema.gamePlayers)
-                .set({ currentRoundTricksTaken: sql`${schema.gamePlayers.currentRoundTricksTaken} + 1` })
-                .where(eq(schema.gamePlayers.id, winningGamePlayerIdForDb));
-            } else {
-              console.error(`[playCard] CRITICAL: Could not update trick winner. WinnerID: ${winningGamePlayerIdForDb}, TrickID: ${currentPlayedTrickId}`);
-            }
-          }
-          console.log(`[playCard TRICK_OVER_RESULT] GameID: ${gameId}, trickOver: ${trickOver}`);
-
-          // --- Determine Next Turn --- 
-          let nextPlayerGamePlayerId: number;
-          if (trickOver) {
-            if (winningGamePlayerIdForDb === undefined) {
-                socket.emit('actionError', { message: 'Error determining trick winner.' });
-                return { success: false, error: 'Winner ID undefined post-determination' }; 
-            }
-            nextPlayerGamePlayerId = winningGamePlayerIdForDb; // Winner of the trick leads next trick
-            // console.log(`[playCard] Trick winner ${nextPlayerGamePlayerId} leads next trick.`);
-          }
-          else {
-            const currentPlayerGamePlayerId = currentSession.currentTurnGamePlayerId;
-            const currentPlayerIndex = playersInOrderRaw.findIndex((p: schema.GamePlayer) => p.id === currentPlayerGamePlayerId);
-            if (currentPlayerIndex === -1) {
-              socket.emit('actionError', { message: 'Error determining current player index for next turn.' });
-              return { success: false, error: 'Player index error for next turn' };
-            }
-            nextPlayerGamePlayerId = playersInOrderRaw[(currentPlayerIndex + 1) % playersInOrderRaw.length].id; // Ensure this assignment is present
-            // console.log(`[playCard] Trick not over. Next turn for player ${nextPlayerGamePlayerId}.`); // Less critical
+          if (!currentTrick) {
+            const [newTrick] = await tx.insert(schema.playedTricks).values({
+              gameSessionId: gameId,
+              roundNumber: gameSession.currentRound || 1,
+              roundTrickNumber: gameSession.currentTrickNumberInRound || 1,
+              leadSuit: card.suit as schema.Suit,
+              createdAt: new Date()
+            }).returning();
+            currentTrick = newTrick;
           }
 
-          // --- Update Game Session --- 
-          const gameSessionUpdateData: Partial<typeof schema.gameSessions.$inferInsert> = {
-            currentTurnGamePlayerId: nextPlayerGamePlayerId,
-            updatedAt: new Date(),
+          // Get current play sequence
+          const existingPlays = await tx.query.playedCardsInTricks.findMany({
+            where: and(
+              eq(schema.playedCardsInTricks.playedTrickId, currentTrick.id)
+            )
+          });
+
+          // Add card to trick
+          await tx.insert(schema.playedCardsInTricks).values({
+            playedTrickId: currentTrick.id,
+            gameSessionId: gameId,
+            roundNumber: gameSession.currentRound || 1,
+            trickNumberInRound: gameSession.currentTrickNumberInRound || 1,
+            gamePlayerId,
+            cardSuit: card.suit as schema.Suit,
+            cardRank: card.rank as schema.Rank,
+            playSequenceInTrick: existingPlays.length + 1,
+            createdAt: new Date()
+          });
+
+          let gameSessionUpdate: Partial<typeof schema.gameSessions.$inferInsert> = {
+            updatedAt: new Date()
           };
 
-          if (isFirstCardOfTrick) { // This was the first card of the trick that just started/continued
-            gameSessionUpdateData.currentTrickLeadSuit = card.suit; // Corrected: leadSuit is the suit of the card played
-          }
+          // Check if trick is complete (4 cards played)
+          if (existingPlays.length + 1 >= 4) {
+            // Trick is complete - determine winner using game logic
+            const allCardsInTrick = await tx.query.playedCardsInTricks.findMany({
+              where: and(
+                eq(schema.playedCardsInTricks.playedTrickId, currentTrick.id)
+              ),
+              orderBy: [asc(schema.playedCardsInTricks.playSequenceInTrick)]
+            });
 
-          if (trickOver) {
-            gameSessionUpdateData.currentTrickNumberInRound = (currentSession.currentTrickNumberInRound ?? 0) + 1;
-            gameSessionUpdateData.currentTrickLeadSuit = null; // Reset for the next trick
+            // Convert DB cards to offline format for trick winner logic
+            const offlineCards: OfflinePlayedCard[] = allCardsInTrick.map(dbCard => ({
+              playerId: dbCard.gamePlayerId.toString(), // Convert number to string
+              card: { suit: dbCard.cardSuit, rank: dbCard.cardRank },
+              playSequenceInTrick: dbCard.playSequenceInTrick
+            }));
+
+            const trickWinner = determineTrickWinner(offlineCards, trumpSuit);
             
-            // **Round Completion & Next Round Preparation (integrated with playCard):**
-            // Detects end of a round based on currentTrickNumberInRound and ROUND_DISTRIBUTION.
-            // currentRound is 1-indexed. ROUND_DISTRIBUTION is 0-indexed.
-            // Use currentSession for immutable properties like currentRound.
-            const numTricksExpectedThisRound = ROUND_DISTRIBUTION[currentSession.currentRound! - 1];
-            // Add a log here too, just before the critical check
-            console.log(`[playCard DEBUG_ROUND_END_CHECK] GameID: ${gameId}, currentRound: ${currentSession.currentRound}, currentTrickNumberInRound_from_session: ${currentSession.currentTrickNumberInRound}, gameSessionUpdateData.currentTrickNumberInRound_for_next: ${gameSessionUpdateData.currentTrickNumberInRound}, numTricksExpectedThisRound: ${numTricksExpectedThisRound}`);
-            
-            // Check if the trick that just ended was the last trick of the round
-            // gameSessionUpdateData.currentTrickNumberInRound is the number for the *next* trick
-            if (gameSessionUpdateData.currentTrickNumberInRound > numTricksExpectedThisRound) {
-              console.log(`[playCard] Round ${currentSession.currentRound} for game ${gameId} is over. Calculating scores...`);
+            // Update trick with winner
+            await tx.update(schema.playedTricks)
+              .set({ winningGamePlayerId: parseInt(trickWinner.playerId) }) // Convert string back to number
+              .where(eq(schema.playedTricks.id, currentTrick.id));
+
+            // Update winner's tricks taken count
+            await tx.update(schema.gamePlayers)
+              .set({ 
+                currentRoundTricksTaken: sql`${schema.gamePlayers.currentRoundTricksTaken} + 1`,
+                updatedAt: new Date()
+              })
+              .where(eq(schema.gamePlayers.id, parseInt(trickWinner.playerId))); // Convert string back to number
+
+            // Check if round is complete
+            const currentRoundNumber = gameSession.currentRound || 1;
+            const expectedTricksThisRound = ROUND_DISTRIBUTION[currentRoundNumber - 1] || 0;
+            const currentTrickNumber = gameSession.currentTrickNumberInRound || 1;
+
+            if (currentTrickNumber >= expectedTricksThisRound) {
+              // Round is complete - calculate scores and set up round summary
+              console.log(`[Socket playCard] Round ${currentRoundNumber} complete. Calculating scores...`);
               
-              // --- Scoring ---
-              const playersForScoring = await tx.query.gamePlayers.findMany({
+              // Get all players with their bids and tricks taken
+              const playersWithStats = await tx.query.gamePlayers.findMany({
                 where: eq(schema.gamePlayers.gameSessionId, gameId),
-                columns: { id: true, currentScore: true, currentRoundTricksTaken: true }
+                orderBy: [asc(schema.gamePlayers.playerOrder)]
               });
 
-              const bidsForRound = await tx.query.playerBids.findMany({
+              const bidsThisRound = await tx.query.playerBids.findMany({
                 where: and(
-                  eq(schema.playerBids.gameSessionId, gameId),
-                  eq(schema.playerBids.roundNumber, currentSession.currentRound!)
+                  eq(schema.playerBids.roundNumber, currentRoundNumber),
+                  inArray(schema.playerBids.gamePlayerId, playersWithStats.map(p => p.id))
                 )
               });
 
-              for (const player of playersForScoring) {
-                let scoreChange = 0;
-                const bidRecord = bidsForRound.find(b => b.gamePlayerId === player.id);
-                if (bidRecord) {
-                  const bidAmount = bidRecord.bidAmount;
-                  const tricksActuallyTaken = player.currentRoundTricksTaken;
+              // Calculate and update scores
+              for (const player of playersWithStats) {
+                const bidRecord = bidsThisRound.find(b => b.gamePlayerId === player.id);
+                const bid = bidRecord ? bidRecord.bidAmount : 0;
+                const tricksTaken = player.currentRoundTricksTaken;
+                
+                const scoreChange = calculatePlayerScore(bid, tricksTaken);
+                const newCumulativeScore = player.currentScore + scoreChange;
 
-                  // console.log(`[server.ts] About to call calculatePlayerScore for player ${player.id}. Bid: ${bidAmount}, Tricks: ${tricksActuallyTaken}`);
-                  scoreChange = calculatePlayerScore(bidAmount, tricksActuallyTaken);
-                  
-                  const newPlayerScore = player.currentScore + scoreChange;
+                // Update player's cumulative score and reset tricks taken
+                await tx.update(schema.gamePlayers)
+                  .set({ 
+                    currentScore: newCumulativeScore,
+                    currentRoundTricksTaken: 0,
+                    updatedAt: new Date()
+                  })
+                  .where(eq(schema.gamePlayers.id, player.id));
 
-                  // Log the score change for the round
-                  await tx.insert(schema.playerRoundScoreChanges).values({
-                    gameSessionId: gameId, // current gameId
-                    gamePlayerId: player.id, // id of the GamePlayer
-                    roundNumber: currentSession.currentRound!, // current round number from session
-                    scoreChange: scoreChange, // the calculated score change for this round
-                    tricksTaken: player.currentRoundTricksTaken, // Populate the new field
-                    // createdAt will default
-                  });
-
-                  await tx.update(schema.gamePlayers)
-                    .set({
-                      currentScore: newPlayerScore,
-                      currentRoundTricksTaken: 0 // Reset for next round
-                    })
-                    .where(eq(schema.gamePlayers.id, player.id));
-                } else {
-                  // console.error(`[server.ts] CRITICAL: No bid record found. Player ID: ${player ? player.id : 'N/A'}, Round: ${currentSession.currentRound}`);
-                }
+                // Record score change for round summary
+                await tx.insert(schema.playerRoundScoreChanges).values({
+                  gameSessionId: gameId,
+                  gamePlayerId: player.id,
+                  roundNumber: currentRoundNumber,
+                  scoreChange,
+                  tricksTaken,
+                  createdAt: new Date()
+                });
               }
-              
-              // ---- Transition to Round Summary ----
-              gameSessionUpdateData.status = 'round_summary';
-              // The actual progression to the next round or game end will be handled by a new 'proceedToNextRound' event.
-              // We will NOT set currentRound, trumpSuit, dealer, turn, or deal cards here anymore.
-              // We will also NOT set winnerGamePlayerId or status='finished' here directly.
-              // This keeps the game in a 'round_summary' state until players acknowledge.
-              console.log(`[playCard] Game ${gameId} status set to round_summary. Initiating timeout.`);
-              // Clear existing timeout for this game, if any
-              const existingTimeout = roundSummaryTimeouts.get(gameId);
-              if (existingTimeout) {
-                clearTimeout(existingTimeout);
-                roundSummaryTimeouts.delete(gameId);
-              }
-              // Set new timeout
-              const timeoutId = setTimeout(() => {
-                console.log(`[Server] Round summary timeout for game ${gameId}. Attempting to auto-proceed.`);
-                // Call the refactored game continuation logic
-                triggerGameContinuation(io, gameId, "timeout_auto_proceed"); 
-                roundSummaryTimeouts.delete(gameId); // Clean up after timeout fires
+
+              // Set game to round_summary status
+              gameSessionUpdate.status = 'round_summary';
+              gameSessionUpdate.currentTurnGamePlayerId = null;
+              console.log(`[Socket playCard] Setting game ${gameId} to round_summary status`);
+
+              // Set timeout to auto-advance after 10 seconds
+              setTimeout(() => {
+                triggerGameContinuation(io, gameId, 'auto_timeout');
               }, ROUND_SUMMARY_TIMEOUT_MS);
-              roundSummaryTimeouts.set(gameId, timeoutId);
 
-
-              // Comment out or remove old next round/game end logic from here:
-              /*
-              const nextRoundNumber = currentSession.currentRound! + 1;
-              if (nextRoundNumber > ROUND_DISTRIBUTION.length) {
-                // Game Over
-                gameSessionUpdateData.status = 'finished';
-                gameSessionUpdateData.currentTurnGamePlayerId = null; 
-                // console.log("[playCard] Game is over. Final round was: ", currentSession.currentRound); 
-
-                let topScore = -Infinity;
-                let potentialWinners: schema.GamePlayer[] = [];
-
-                for (const player of playersInOrderRaw) {
-                    if (player.currentScore > topScore) {
-                        topScore = player.currentScore;
-                        potentialWinners = [player];
-                    } else if (player.currentScore === topScore) {
-                        potentialWinners.push(player);
-                    }
-                }
-
-                if (potentialWinners.length > 0) {
-                  potentialWinners.sort((a, b) => a.playerOrder - b.playerOrder);
-                  const gameWinner = potentialWinners[0];
-                  gameSessionUpdateData.winnerGamePlayerId = gameWinner.id;
-                  // console.log(`[playCard] Game winner determined: Player ${gameWinner.id} with score ${gameWinner.currentScore}. Tie-breakers (if any) resolved by playerOrder.`);
-                } else {
-                  // console.error(`[playCard] CRITICAL: Could not determine game winner for game ${gameId}. No players found or scores were problematic.`);
-                }
-              } else {
-                // Prepare for Next Round
-                gameSessionUpdateData.currentRound = nextRoundNumber;
-                gameSessionUpdateData.currentTrickNumberInRound = 1; 
-                gameSessionUpdateData.status = 'bidding'; 
-                
-                const newTrumpSuit = determineTrumpForNewRound();
-                gameSessionUpdateData.trumpSuit = newTrumpSuit;
-                
-                const currentDealerIndex = playersInOrderRaw.findIndex(p => p.id === currentSession.currentDealerId);
-                let nextDealerId = currentSession.currentDealerId; 
-                if (currentDealerIndex !== -1 && playersInOrderRaw.length > 0) {
-                    nextDealerId = playersInOrderRaw[(currentDealerIndex + 1) % playersInOrderRaw.length].id;
-                }
-                gameSessionUpdateData.currentDealerId = nextDealerId;
-                const nextDealerActualIndex = playersInOrderRaw.findIndex(p => p.id === nextDealerId);
-                if (nextDealerActualIndex !== -1 && playersInOrderRaw.length > 0) {
-                    gameSessionUpdateData.currentTurnGamePlayerId = playersInOrderRaw[(nextDealerActualIndex + 1) % playersInOrderRaw.length].id;
-                }
-
-                // console.log(`[playCard] Preparing for round ${nextRoundNumber}. Status: bidding. New Trump: ${newTrumpSuit}. New Dealer: ${gameSessionUpdateData.currentDealerId}, First to bid: ${gameSessionUpdateData.currentTurnGamePlayerId}`); 
-                await dealCardsForRound(tx, gameId, nextRoundNumber, playersInOrderRaw.map(p => ({id: p.id })));
-              }
-              */
+            } else {
+              // More tricks to play in this round
+              gameSessionUpdate.currentTrickNumberInRound = currentTrickNumber + 1;
+              gameSessionUpdate.currentTurnGamePlayerId = parseInt(trickWinner.playerId); // Convert string back to number
+              console.log(`[Socket playCard] Trick ${currentTrickNumber} complete. Winner ${trickWinner.playerId} starts trick ${currentTrickNumber + 1}`);
             }
+          } else {
+            // Move to next player - ensure players are ordered by playerOrder
+            const playersInOrder = gameSession.gamePlayers.sort((a, b) => a.playerOrder - b.playerOrder);
+            const currentPlayerIndex = playersInOrder.findIndex(p => p.id === gamePlayerId);
+            const nextPlayerIndex = (currentPlayerIndex + 1) % playersInOrder.length;
+            const nextPlayer = playersInOrder[nextPlayerIndex];
+            gameSessionUpdate.currentTurnGamePlayerId = nextPlayer.id;
+            console.log(`[Socket playCard] Turn advancing from player ${gamePlayerId} (index ${currentPlayerIndex}) to player ${nextPlayer.id} (index ${nextPlayerIndex})`);
           }
 
           await tx.update(schema.gameSessions)
-            .set(gameSessionUpdateData)
+            .set(gameSessionUpdate)
             .where(eq(schema.gameSessions.id, gameId));
-          
-          console.log(`[playCard TXN_END] GameID: ${gameId}, PlayerID: ${gamePlayerId}. DB updated. success: true`);
-          return { success: true };
         });
 
-        
-        if (result && result.success) {
-          let updatedGameData;
-          try {
-            console.log(`[playCard PRE_GET_GAME_DATA] GameID: ${gameId}`);
-            updatedGameData = await getGameDataForBroadcast(gameId);
-            console.log(`[playCard POST_GET_GAME_DATA] GameID: ${gameId}, Data fetched: ${!!updatedGameData}`);
-          } catch (e) {
-            console.error(`[playCard CATCH_ERROR_GET_GAME_DATA] GameID: ${gameId}, Error: `, e);
-            throw e; 
-          }
-
-          if (updatedGameData) {
-            try {
-              console.log(`[playCard PRE_IO_EMIT] GameID: ${gameId}`);
-              io.to(gameId.toString()).emit('gameStateUpdate', updatedGameData);
-              console.log(`[playCard POST_IO_EMIT] GameID: ${gameId}`);
-            } catch (e) {
-              console.error(`[playCard CATCH_ERROR_IO_EMIT] GameID: ${gameId}, Error: `, e);
-              throw e; 
-            }
-          }
-          try {
-            console.log(`[playCard PRE_SOCKET_EMIT_SUCCESS] GameID: ${gameId}`);
-            socket.emit('playCardSuccess', { message: 'Kaart gespeeld succesvol.', gameId: gameId });
-            console.log(`[playCard SUCCESS_EMIT] GameID: ${gameId}, PlayerID: ${gamePlayerId}`);
-          } catch (e) {
-            console.error(`[playCard CATCH_ERROR_SOCKET_EMIT_SUCCESS] GameID: ${gameId}, Error: `, e);
-            throw e;
-          }
-        } else if (result && result.error) {
-          console.error(`[playCard ERROR_RESULT] GameID: ${gameId}, PlayerID: ${gamePlayerId}, Error: ${result.error}`);
-        }
+        // Broadcast updated game state
+        const updatedGameState = await getGameDataForBroadcast(gameId);
+        io.to(`game_${gameId}`).emit('gameStateUpdate', updatedGameState);
 
       } catch (error) {
-        console.error(`[playCard CATCH_ERROR] GameID: ${gameId}, PlayerID: ${gamePlayerId}, Card: ${card.rank} of ${card.suit}, Error: `, error);
-        socket.emit('actionError', { message: 'Server error processing card play.' });
+        console.error('[Socket playCard] Error:', error);
+        socket.emit('actionError', { message: 'Fout bij spelen van kaart.' });
       }
     });
 
     socket.on('proceedToNextRound', async (data: { gameId: number }) => {
-      const { gameId } = data;
-      console.log(`[proceedToNextRound] Received for game ${gameId} from host action.`);
-
-      // Clear existing timeout if host proceeds manually
-      const existingTimeout = roundSummaryTimeouts.get(gameId);
-      if (existingTimeout) {
-        clearTimeout(existingTimeout);
-        roundSummaryTimeouts.delete(gameId);
-        console.log(`[proceedToNextRound] Cleared existing round_summary timeout for game ${gameId}.`);
-      }
+      console.log(`[Socket proceedToNextRound] Received from socket ${socket.id}:`, data);
       
-      await triggerGameContinuation(io, gameId, "host_manual_proceed");
+      try {
+        const { gameId } = data;
+        await triggerGameContinuation(io, gameId, 'client_socket');
+        
+        // Broadcast updated game state
+        const updatedGameState = await getGameDataForBroadcast(gameId);
+        io.to(`game_${gameId}`).emit('gameStateUpdate', updatedGameState);
+
+      } catch (error) {
+        console.error('[Socket proceedToNextRound] Error:', error);
+        socket.emit('actionError', { message: 'Fout bij doorgaan naar volgende ronde.' });
+      }
     });
 
+    socket.on('createGame', async (data, callback) => {
+      console.log('[Socket Event - createGame] Received:', data);
+    });
+
+    socket.on('joinGame', async (data: { gameSessionId: number, userId: number }, callback) => {
+      console.log('[Socket Event - joinGame] Received:', data);
+    });
+
+    // Handle client notification of new game creation
+    socket.on('clientNewGameCreated', (data: { newGameId: number }) => {
+      console.log(`[Socket clientNewGameCreated] Received from socket ${socket.id}:`, data);
+      // Broadcast to all clients that the open games list should be refreshed
+      io.emit('openGamesUpdated', { newGameId: data.newGameId });
+      console.log(`[Socket clientNewGameCreated] Broadcasted 'openGamesUpdated' event for game ${data.newGameId}`);
+    });
+
+    socket.on('disconnect', () => {
+      console.log('User disconnected:', socket.id);
+    });
   });
 
-  httpServer.listen(PORT, () => {
-    console.log(`> Ready on http://localhost:${PORT}`); 
+  httpServer
+    .once('error', (err) => {
+      console.error('HTTP server error:', err);
+      process.exit(1);
+    })
+    .listen(port, () => {
+      if (isProduction) {
+        console.log(`> Production server ready on http://${hostname}:${port}`);
+      } else {
+        console.log(`> Socket.IO server ready for development on http://${hostname}:${port}`);
+        console.log(`> Run 'pnpm dev:next' (or yarn/npm) in a separate terminal for the Next.js frontend.`);
+      }
+    });
+}
+
+// Prepare Next.js app only in production, then start the server.
+// In development (socket only), just start the server.
+if (isProduction && app) {
+  app.prepare()
+    .then(startServer)
+    .catch(err => {
+      console.error("Next.js app preparation error:", err);
+      process.exit(1);
+    });
+} else if (!isProduction) {
+  startServer().catch(err => { // Start server directly for dev:socket
+      console.error("Socket.IO server failed to start in development:", err);
+      process.exit(1);
   });
-}); 
+} else {
+    // This case should ideally not be reached if app is defined only in production
+    console.error("Server configuration error: app not defined for production mode.");
+    process.exit(1);
+} 

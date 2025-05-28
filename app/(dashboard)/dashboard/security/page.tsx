@@ -5,7 +5,7 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Lock, Trash2, Loader2 } from 'lucide-react';
-import { useActionState } from 'react';
+import { useState } from 'react';
 import { updatePassword, deleteAccount } from '@/app/(login)/actions';
 
 type PasswordState = {
@@ -23,15 +23,31 @@ type DeleteState = {
 };
 
 export default function SecurityPage() {
-  const [passwordState, passwordAction, isPasswordPending] = useActionState<
-    PasswordState,
-    FormData
-  >(updatePassword, {});
+  const [passwordState, setPasswordState] = useState<PasswordState>({});
+  const [isPasswordPending, setIsPasswordPending] = useState(false);
 
-  const [deleteState, deleteAction, isDeletePending] = useActionState<
-    DeleteState,
-    FormData
-  >(deleteAccount, {});
+  const [deleteState, setDeleteState] = useState<DeleteState>({});
+  const [isDeletePending, setIsDeletePending] = useState(false);
+
+  const handlePasswordAction = async (formData: FormData) => {
+    setIsPasswordPending(true);
+    try {
+      const result = await updatePassword(passwordState, formData);
+      setPasswordState(result);
+    } finally {
+      setIsPasswordPending(false);
+    }
+  };
+
+  const handleDeleteAction = async (formData: FormData) => {
+    setIsDeletePending(true);
+    try {
+      const result = await deleteAccount(deleteState, formData);
+      setDeleteState(result);
+    } finally {
+      setIsDeletePending(false);
+    }
+  };
 
   return (
     <section className="flex-1 p-4 lg:p-8">
@@ -43,7 +59,7 @@ export default function SecurityPage() {
           <CardTitle>Password</CardTitle>
         </CardHeader>
         <CardContent>
-          <form className="space-y-4" action={passwordAction}>
+          <form className="space-y-4" action={handlePasswordAction}>
             <div>
               <Label htmlFor="current-password" className="mb-2">
                 Current Password
@@ -123,7 +139,7 @@ export default function SecurityPage() {
           <p className="text-sm text-gray-500 mb-4">
             Account deletion is non-reversable. Please proceed with caution.
           </p>
-          <form action={deleteAction} className="space-y-4">
+          <form action={handleDeleteAction} className="space-y-4">
             <div>
               <Label htmlFor="delete-password" className="mb-2">
                 Confirm Password

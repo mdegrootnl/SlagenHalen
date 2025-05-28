@@ -1,6 +1,6 @@
 'use client';
 
-import { useActionState } from 'react';
+import { useState, useTransition, Suspense } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -9,7 +9,6 @@ import { Loader2 } from 'lucide-react';
 import { updateAccount } from '@/app/(login)/actions';
 import { User } from '@/lib/db/schema';
 import useSWR from 'swr';
-import { Suspense } from 'react';
 
 const fetcher = (url: string) => fetch(url).then((res) => res.json());
 
@@ -73,10 +72,24 @@ function AccountFormWithData({ state }: { state: ActionState }) {
 }
 
 export default function GeneralPage() {
-  const [state, formAction, isPending] = useActionState<ActionState, FormData>(
-    updateAccount,
-    {}
-  );
+  const [state, setState] = useState<ActionState>({});
+  const [isPending, startTransition] = useTransition();
+
+  const handleSubmit = (formData: FormData) => {
+    startTransition(() => {
+      // Intentionally empty or for immediate synchronous state updates before async call
+      // For example, you might clear previous error/success messages here if desired:
+      // setState({ name: state.name, error: undefined, success: undefined });
+    });
+
+    // Perform the async server action
+    updateAccount(state, formData) // Pass current state if action needs it
+      .then(setState) // setState directly with the result
+      .catch(error => {
+        console.error("Update account failed:", error);
+        setState({ error: "Failed to update account." }); // Set an error state
+      });
+  };
 
   return (
     <section className="flex-1 p-4 lg:p-8">
@@ -89,7 +102,7 @@ export default function GeneralPage() {
           <CardTitle>Account Information</CardTitle>
         </CardHeader>
         <CardContent>
-          <form className="space-y-4" action={formAction}>
+          <form className="space-y-4" action={handleSubmit}>
             <Suspense fallback={<AccountForm state={state} />}>
               <AccountFormWithData state={state} />
             </Suspense>

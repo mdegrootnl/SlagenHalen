@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useActionState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,10 +15,20 @@ export function Login({ mode = 'signin' }: { mode?: 'signin' | 'signup' }) {
   const redirect = searchParams.get('redirect');
   const priceId = searchParams.get('priceId');
   const inviteId = searchParams.get('inviteId');
-  const [state, formAction, pending] = useActionState<ActionState, FormData>(
-    mode === 'signin' ? signIn : signUp,
-    { error: '' }
-  );
+  
+  const [state, setState] = useState<ActionState>({ error: '' });
+  const [isPending, setIsPending] = useState(false);
+
+  const handleSubmit = async (formData: FormData) => {
+    setIsPending(true);
+    try {
+      const action = mode === 'signin' ? signIn : signUp;
+      const result = await action(state, formData);
+      setState(result);
+    } finally {
+      setIsPending(false);
+    }
+  };
 
   useEffect(() => {
     if (state) {
@@ -52,7 +62,7 @@ export function Login({ mode = 'signin' }: { mode?: 'signin' | 'signup' }) {
 
       <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
         <div className="bg-slate-800 py-8 px-4 shadow sm:rounded-lg sm:px-10">
-          <form className="space-y-6" action={formAction}>
+          <form className="space-y-6" action={handleSubmit}>
             <input type="hidden" name="redirect" value={redirect || ''} />
             <input type="hidden" name="priceId" value={priceId || ''} />
             <input type="hidden" name="inviteId" value={inviteId || ''} />
@@ -71,7 +81,7 @@ export function Login({ mode = 'signin' }: { mode?: 'signin' | 'signup' }) {
                     name="name"
                     type="text"
                     autoComplete="name"
-                    defaultValue={state.name}
+                    defaultValue={state?.name || ''}
                     required
                     maxLength={100}
                     className="appearance-none rounded-md relative block w-full px-3 py-2 border border-slate-600 bg-slate-700 placeholder-slate-400 text-slate-100 focus:outline-none focus:ring-purple-500 focus:border-purple-500 focus:z-10 sm:text-sm"
@@ -94,7 +104,7 @@ export function Login({ mode = 'signin' }: { mode?: 'signin' | 'signup' }) {
                   name="email"
                   type="email"
                   autoComplete="email"
-                  defaultValue={state.email}
+                  defaultValue={state?.email || ''}
                   required
                   maxLength={50}
                   className="appearance-none rounded-md relative block w-full px-3 py-2 border border-slate-600 bg-slate-700 placeholder-slate-400 text-slate-100 focus:outline-none focus:ring-purple-500 focus:border-purple-500 focus:z-10 sm:text-sm"
@@ -118,7 +128,7 @@ export function Login({ mode = 'signin' }: { mode?: 'signin' | 'signup' }) {
                   autoComplete={
                     mode === 'signin' ? 'current-password' : 'new-password'
                   }
-                  defaultValue={state.password}
+                  defaultValue={state?.password || ''}
                   required
                   minLength={8}
                   maxLength={100}
@@ -136,9 +146,9 @@ export function Login({ mode = 'signin' }: { mode?: 'signin' | 'signup' }) {
               <Button
                 type="submit"
                 className={`w-full flex justify-center items-center py-2.5 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white ${mode === 'signin' ? 'bg-purple-600 hover:bg-purple-700 focus:ring-purple-500' : 'bg-sky-600 hover:bg-sky-700 focus:ring-sky-500'} focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-800`}
-                disabled={pending}
+                disabled={isPending}
               >
-                {pending ? (
+                {isPending ? (
                   <>
                     <Loader2 className="animate-spin mr-2 h-4 w-4" />
                     Bezig...

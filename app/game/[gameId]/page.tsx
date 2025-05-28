@@ -464,7 +464,7 @@ export default function GamePage() {
   // Helper function to generate card image URL based on new convention
   const getCardImageUrl = (card: Card | null | undefined): string => {
     if (!card) {
-      return '/images/playing_cards/card_back.svg'; // Or a placeholder for an empty/error state
+      return '/images/playing_cards/joker_black.svg'; // Fallback to black joker when no card
     }
 
     const suitName = card.suit.toLowerCase(); // e.g., 'spades', 'hearts'
@@ -480,7 +480,7 @@ export default function GamePage() {
       // If they were 'TWO', 'THREE', etc., add cases here.
     }
 
-    return `/images/playing_cards/${suitName}_${rankName}.png`;
+    return `/images/playing_cards/${suitName}_${rankName}.svg`;
   };
 
   // Helper function to generate Dutch alt text for cards

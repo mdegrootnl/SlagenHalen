@@ -26,8 +26,12 @@ export const SocketProvider: React.FC<SocketProviderProps> = ({ children }) => {
 
   useEffect(() => {
     // The URL should point to your server where Socket.IO is running.
-    // This will typically be the same origin as your Next.js app when using the custom server.
-    const newSocket = io(); 
+    // In development, Socket.IO server runs on port 3001, Next.js on port 3000
+    const socketUrl = process.env.NODE_ENV === 'production' 
+      ? undefined // In production, same origin
+      : 'http://localhost:3001'; // In development, explicit port
+    
+    const newSocket = io(socketUrl); 
 
     setSocket(newSocket);
 
