@@ -1,6 +1,6 @@
 const nextConfig = {
   experimental: {
-    // ppr: true, // Disabled as it requires canary for Next.js 14.2.0
+    ppr: true, // Re-enabled for Next.js 15.1
     clientSegmentCache: true,
     nodeMiddleware: true
   }
