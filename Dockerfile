@@ -35,6 +35,10 @@ RUN pnpm install --frozen-lockfile
 ARG POSTGRES_URL_BUILD_TIME="postgresql://builduser:buildpass@localhost:5432/builddb"
 ENV POSTGRES_URL=${POSTGRES_URL_BUILD_TIME}
 
+# Provide AUTH_SECRET for the build stage if middleware/auth logic runs during build
+ARG AUTH_SECRET_BUILD_TIME="vGYKkvA2NqDuWVjROsfS/h6wYIMSIO90vezSSkXdYm4=" # Updated with generated key
+ENV AUTH_SECRET=${AUTH_SECRET_BUILD_TIME}
+
 # Clean .next directory before build to ensure a fresh build
 RUN rm -rf .next
 
@@ -59,10 +63,10 @@ COPY --from=base /app/node_modules ./node_modules
 COPY --from=base /app/server.ts ./server.ts
 COPY --from=base /app/next.config.ts ./next.config.ts
 COPY --from=base /app/tsconfig.json ./tsconfig.json
+COPY --from=base /app/lib ./lib
 
-
-# Expose the port the app runs on (Next.js default is 3000)
-EXPOSE 3000
+# Expose the port the app runs on
+EXPOSE 3001
 
 # Set environment variables for runtime
 ENV NODE_ENV=production
