@@ -25,13 +25,9 @@ const dev = !isProduction; // For Next.js app initialization
 const hostname = 'localhost'; // Or your desired hostname
 const port = parseInt(process.env.PORT || '3001', 10);
 
-let app: ReturnType<typeof next> | undefined;
-let handle: ReturnType<ReturnType<typeof next>['getRequestHandler']> | undefined;
-
-if (isProduction) {
-  app = next({ dev: false, hostname, port }); // Ensure dev is false for production
-  handle = app?.getRequestHandler();
-}
+// Initialize Next.js app properly for both dev and production
+const app = next({ dev, hostname, port });
+const handle = app.getRequestHandler();
 
 // Helper function to deal cards for a new round
 async function dealCardsForRound(
@@ -475,26 +471,23 @@ async function triggerGameContinuation(io: SocketIOServer, gameId: number, sourc
 
 // Main function to start the server
 async function startServer() {
+  try {
+    // Prepare the Next.js app
+    await app.prepare();
+    console.log('Next.js app prepared successfully');
+  } catch (error) {
+    console.error('Error preparing Next.js app:', error);
+    process.exit(1);
+  }
+
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    if (isProduction && handle) { // Only handle Next.js requests in production
-      try {
-        const parsedUrl = parse(req.url!, true);
-        await handle(req, res, parsedUrl);
-      } catch (err) {
-        console.error('Error handling Next.js request:', err);
-        res.statusCode = 500;
-        res.end('internal server error');
-      }
-    } else {
-      // In development (dev:socket mode), or if Next.js handling is not set up
-      res.setHeader('Content-Type', 'application/json');
-      if (req.url === '/health') {
-        res.statusCode = 200;
-        res.end(JSON.stringify({ status: 'ok', mode: isProduction ? 'production' : 'development_socket_only' }));
-      } else {
-        res.statusCode = 404;
-        res.end(JSON.stringify({ message: 'Not Found. This is the Socket.IO server. Next.js handles requests separately in development.' }));
-      }
+    try {
+      const parsedUrl = parse(req.url!, true);
+      await handle(req, res, parsedUrl);
+    } catch (err) {
+      console.error('Error handling request:', err);
+      res.statusCode = 500;
+      res.end('internal server error');
     }
   });
 
