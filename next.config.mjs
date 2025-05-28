@@ -1,8 +1,8 @@
 const nextConfig = {
   experimental: {
-    ppr: true, // Re-enabled for Next.js 15.1
+    // ppr: true, // Disabled again, as 15.1.0 stable might still have specific requirements
     clientSegmentCache: true,
-    nodeMiddleware: true
+    // nodeMiddleware: true // Removed, not a recognized option in Next.js 15.1.0
   }
 };
 
