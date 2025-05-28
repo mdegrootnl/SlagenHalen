@@ -21,12 +21,11 @@ const roundSummaryTimeouts = new Map<number, NodeJS.Timeout>();
 const ROUND_SUMMARY_TIMEOUT_MS = 10000; // 10 seconds
 
 const isProduction = process.env.NODE_ENV === 'production';
-const dev = !isProduction; // For Next.js app initialization
-const hostname = 'localhost'; // Or your desired hostname
+const dev = !isProduction;
 const port = parseInt(process.env.PORT || '3001', 10);
 
-// Initialize Next.js app properly for both dev and production
-const app = next({ dev, hostname, port });
+// Initialize Next.js app with minimal configuration for better compatibility
+const app = next({ dev });
 const handle = app.getRequestHandler();
 
 // Helper function to deal cards for a new round
@@ -957,9 +956,9 @@ async function startServer() {
     })
     .listen(port, () => {
       if (isProduction) {
-        console.log(`> Production server ready on http://${hostname}:${port}`);
+        console.log(`> Production server ready on http://localhost:${port}`);
       } else {
-        console.log(`> Socket.IO server ready for development on http://${hostname}:${port}`);
+        console.log(`> Socket.IO server ready for development on http://localhost:${port}`);
         console.log(`> Run 'pnpm dev:next' (or yarn/npm) in a separate terminal for the Next.js frontend.`);
       }
     });
